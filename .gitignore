@@ -1,0 +1,7 @@
+*.wav
+*.mat
+*.asv
+*.bak
+live_sessions/
+slprj/
+*.slxc
