@@ -161,6 +161,7 @@ def run_command(args: argparse.Namespace) -> int:
         "--coarse-step", str(args.coarse_step),
         "--refinements", str(args.refinements),
         "--min-score", str(args.min_score),
+        "--min-level-db", str(args.min_level_db),
         "--bounds", *[str(value) for value in bounds],
     ]
     if args.speaker_position is not None:
@@ -222,6 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--coarse-step", type=float, default=0.10)
     run.add_argument("--refinements", type=int, default=3)
     run.add_argument("--min-score", type=float, default=0.25)
+    run.add_argument("--min-level-db", type=float, default=-50.0,
+                     help="minimum level for a live direction in dBFS (default: -50)")
     run.add_argument(
         "--bounds", type=float, nargs=6, default=(-1, 1, -1, 1, 0, 0),
         metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"),

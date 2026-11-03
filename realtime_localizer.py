@@ -86,8 +86,17 @@ class LivePlot:
         hi = np.maximum(bounds[:2, 1], positions[:, :2].max(axis=0) + 0.1)
         self.top.set_xlim(lo[0], hi[0])
         self.top.set_ylim(lo[1], hi[1])
-        self.top.set_title("Unified 2D direction")
+        self.top.set_title("Unified 2D direction (fixed display radius)")
         self.top.legend(loc="lower right", fontsize=8)
+        x_span = np.diff(self.top.get_xlim())[0]
+        y_span = np.diff(self.top.get_ylim())[0]
+        self.display_radius = 0.35 * min(x_span, y_span)
+        angles = np.linspace(0.0, 2.0 * np.pi, 361)
+        self.top.plot(
+            self.display_radius * np.sin(angles),
+            self.display_radius * np.cos(angles),
+            "--", color="0.85", lw=1,
+        )
         (self.trail,) = self.top.plot([], [], "-", color="0.6", lw=1)
         (self.direction,) = self.top.plot([], [], "-", color="red", lw=2)
         (self.dot,) = self.top.plot([], [], "o", color="red", ms=12)
@@ -97,16 +106,18 @@ class LivePlot:
 
     def update(self, position: np.ndarray, score: float, level: float,
                clear: bool) -> None:
+        x, y = position[:2]
+        azimuth = np.degrees(np.arctan2(x, y))
+        angle = np.arctan2(x, y)
+        display = self.display_radius * np.array([np.sin(angle), np.cos(angle)])
         if clear:
-            self.track = (self.track + [position])[-20:]
+            self.track = (self.track + [display])[-20:]
             points = np.asarray(self.track)
             self.trail.set_data(points[:, 0], points[:, 1])
-        x, y = position[:2]
-        self.direction.set_data([0.0, x], [0.0, y])
+        self.direction.set_data([0.0, display[0]], [0.0, display[1]])
         self.direction.set_color("red" if clear else "0.6")
-        self.dot.set_data([x], [y])
+        self.dot.set_data([display[0]], [display[1]])
         self.dot.set_color("red" if clear else "0.6")
-        azimuth = np.degrees(np.arctan2(x, y))
         status = "live" if clear else "last/uncertain - no clear sound"
         self.fig.suptitle(
             f"Direction {azimuth:+.2f} deg   score={score:.2f}   "
@@ -172,6 +183,8 @@ def main() -> None:
     parser.add_argument("--refinements", type=int, default=3)
     parser.add_argument("--min-score", type=float, default=0.25,
                         help="estimates below this SRP score are treated as no clear source")
+    parser.add_argument("--min-level-db", type=float, default=-50.0,
+                        help="minimum broadband level for a live result in dBFS (default: -50)")
     parser.add_argument("--plot", action="store_true",
                         help="show the live unified 2D direction and microphone layout")
     parser.add_argument(
@@ -412,7 +425,9 @@ def main() -> None:
             audio = np.concatenate(synchronized, axis=1)[:, active]
             result = localizer.localize(audio)
             level = 20 * np.log10(np.sqrt(np.mean(audio**2)) + 1e-12)
-            clear = result.score >= args.min_score
+            loud_enough = level >= args.min_level_db
+            clear = loud_enough and result.score >= args.min_score
+            reason = "no clear sound" if loud_enough else "below level threshold"
             now = time.monotonic()
             if clear:
                 last_result = result
@@ -421,14 +436,13 @@ def main() -> None:
                 status = "live"
             elif last_result is not None:
                 shown = last_result
-                status = f"last valid {now - last_result_time:.1f}s ago; no clear sound"
+                status = f"last valid {now - last_result_time:.1f}s ago; {reason}"
             else:
                 shown = result
-                status = "uncertain; no clear sound"
+                status = f"uncertain; {reason}"
             mode = "cross-array" if use_cross else "board-local"
-            x, y = shown.position[:2]
             print(
-                f"Direction: {shown.azimuth_deg:+7.2f} deg  x={x:+.3f} y={y:+.3f} m  "
+                f"Direction: {shown.azimuth_deg:+7.2f} deg  "
                 f"score={result.score:.3f} level={level:5.1f} dBFS  "
                 f"{mode}; {status}",
                 flush=True,
