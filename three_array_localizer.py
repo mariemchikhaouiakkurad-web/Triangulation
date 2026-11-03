@@ -28,7 +28,7 @@ from typing import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import fft
+from scipy import fft, stats
 
 FloatArray = NDArray[np.floating]
 
@@ -46,12 +46,22 @@ class SyncResult:
     offset: float
     drift: float
     residual_rms: float
+    accepted: bool = True
+    inlier_count: int = 0
+    offset_std: float = float("inf")
+    drift_std: float = float("inf")
+    max_error_95: float = float("inf")
+    acoustic_delay: float = 0.0
 
 
 @dataclass
 class LocalizationResult:
     position: NDArray[np.float64]
     score: float
+
+    @property
+    def azimuth_deg(self) -> float:
+        return float(np.degrees(np.arctan2(self.position[0], self.position[1])))
 
 
 def gcc_phat(
@@ -104,41 +114,78 @@ def estimate_sync(
     windows: int = 8,
     window_seconds: float = 0.5,
     max_offset: float = 0.25,
+    acoustic_delay: float = 0.0,
+    max_sync_error: float | None = None,
 ) -> SyncResult:
-    """Estimate constant offset and linear clock drift from a calibration recording.
-
-    reference and other are single channels containing the same electrical pulse
-    or common calibration stimulus. At least two separated windows are required;
-    more windows make the drift estimate more reliable.
-    """
+    """Estimate offset/drift with robust regression and a prediction-error check."""
     reference = np.asarray(reference, dtype=np.float64).squeeze()
     other = np.asarray(other, dtype=np.float64).squeeze()
     available = min(len(reference), len(other))
     window_length = int(window_seconds * sample_rate)
-    if available < 2 * window_length or windows < 2:
-        raise ValueError("Recording is too short for offset/drift estimation")
+    if available < 2 * window_length or windows < 3:
+        raise ValueError("At least three calibration windows are required")
+    tolerance = 1.0 / sample_rate if max_sync_error is None else max_sync_error
+    if tolerance <= 0:
+        raise ValueError("max_sync_error must be positive")
 
     starts = np.linspace(0, available - window_length, windows, dtype=int)
     times: list[float] = []
     delays: list[float] = []
     for start in starts:
         stop = start + window_length
+        if not np.any(reference[start:stop]) or not np.any(other[start:stop]):
+            continue
         delay, _ = gcc_phat(
-            other[start:stop],
-            reference[start:stop],
-            sample_rate,
-            max_offset,
+            other[start:stop], reference[start:stop], sample_rate, max_offset
         )
         times.append((start + 0.5 * window_length) / sample_rate)
-        delays.append(delay)
+        delays.append(delay - acoustic_delay)
+    if len(times) < 3:
+        return SyncResult(0.0, 0.0, float("inf"), False, len(times), acoustic_delay=acoustic_delay)
 
-    slope, offset = np.polyfit(times, delays, 1)
-    fitted = offset + slope * np.asarray(times)
-    residual = float(np.sqrt(np.mean((np.asarray(delays) - fitted) ** 2)))
+    t = np.asarray(times)
+    d = np.asarray(delays)
+    slope, offset, _, _ = stats.theilslopes(d, t, 0.95)
+    preliminary = d - (offset + slope * t)
+    centre = np.median(preliminary)
+    scale = 1.4826 * np.median(np.abs(preliminary - centre))
+    if scale > np.finfo(float).eps:
+        alpha = 0.05 / len(t)
+        cutoff = stats.t.ppf(1.0 - alpha / 2.0, max(len(t) - 3, 1)) * scale
+        inliers = np.abs(preliminary - centre) <= cutoff
+    else:
+        inliers = np.abs(preliminary - centre) <= np.finfo(float).eps
+    if np.count_nonzero(inliers) < 3:
+        return SyncResult(
+            float(offset), float(-slope), float("inf"), False,
+            int(np.count_nonzero(inliers)), acoustic_delay=acoustic_delay,
+        )
 
-    # If measured delay(t) = offset - drift*t, the array's sample-time scale
-    # is (1 + drift). Resampling below uses that same convention.
-    return SyncResult(float(offset), float(-slope), residual)
+    ti = t[inliers]
+    di = d[inliers]
+    slope, offset = np.polyfit(ti, di, 1)
+    residuals = di - (offset + slope * ti)
+    residual_rms = float(np.sqrt(np.mean(residuals**2)))
+    design = np.column_stack((np.ones(len(ti)), ti))
+    covariance = np.full((2, 2), np.inf)
+    max_error_95 = float("inf")
+    if len(ti) > 2 and np.ptp(ti) > 0:
+        sigma2 = float(np.sum(residuals**2) / (len(ti) - 2))
+        covariance = sigma2 * np.linalg.inv(design.T @ design)
+        endpoints = np.array([0.0, float(np.max(t))])
+        prediction = np.column_stack((np.ones(2), endpoints))
+        variance = sigma2 + np.einsum("ij,jk,ik->i", prediction, covariance, prediction)
+        max_error_95 = float(np.max(stats.t.ppf(0.975, len(ti) - 2) * np.sqrt(variance)))
+    accepted = bool(
+        len(ti) >= 3
+        and np.isfinite(max_error_95)
+        and max_error_95 <= tolerance
+    )
+    return SyncResult(
+        float(offset), float(-slope), residual_rms, accepted, len(ti),
+        float(np.sqrt(covariance[0, 0])), float(np.sqrt(covariance[1, 1])),
+        max_error_95, acoustic_delay,
+    )
 
 
 def align_array(
@@ -276,6 +323,8 @@ class SRPPhatLocalizer:
         coarse_step: float = 0.05,
         refinements: int = 3,
         interpolation: int = 4,
+        array_ids: NDArray | None = None,
+        use_cross_array: bool = True,
     ) -> None:
         self.positions = np.asarray(microphone_positions, dtype=np.float64)
         self.sample_rate = float(sample_rate)
@@ -289,14 +338,25 @@ class SRPPhatLocalizer:
             raise ValueError("microphone_positions must have shape (microphones, 3)")
         if self.bounds.shape != (3, 2) or np.any(self.bounds[:, 0] > self.bounds[:, 1]):
             raise ValueError("search_bounds must be [[xmin,xmax],[ymin,ymax],[zmin,zmax]]")
+        if array_ids is None:
+            array_ids = np.zeros(len(self.positions), dtype=int)
+        self.array_ids = np.asarray(array_ids, dtype=int)
+        if self.array_ids.shape != (len(self.positions),):
+            raise ValueError("array_ids must contain one array index per microphone")
 
-        self.pairs = np.asarray(list(combinations(range(len(self.positions)), 2)))
+        pairs = np.asarray(list(combinations(range(len(self.positions)), 2)))
+        if not use_cross_array:
+            pairs = pairs[self.array_ids[pairs[:, 0]] == self.array_ids[pairs[:, 1]]]
+        self.pairs = pairs
+        if not len(self.pairs):
+            raise ValueError("The selected microphone pairs are empty")
         diameters = np.linalg.norm(
-            self.positions[:, None, :] - self.positions[None, :, :], axis=-1
+            self.positions[self.pairs[:, 0]] - self.positions[self.pairs[:, 1]], axis=1
         )
         self.max_tdoa = float(np.max(diameters) / self.c + 2.0 / self.sample_rate)
         self._delay_grid: NDArray | None = None
         self._pair_responses: NDArray | None = None
+        self._pair_weights: NDArray | None = None
 
     def _prepare_responses(self, audio: NDArray) -> None:
         """Precompute interpolated pairwise GCC-PHAT functions for one frame."""
@@ -305,10 +365,19 @@ class SRPPhatLocalizer:
             raise ValueError("Audio channels do not match microphone coordinates")
 
         audio = audio - np.mean(audio, axis=0, keepdims=True)
-        audio *= np.hanning(len(audio))[:, None]
-        nfft = fft.next_fast_len(2 * len(audio))
-        spectra = fft.rfft(audio, nfft, axis=0)
+        segment_length = min(2048, len(audio))
+        starts = np.linspace(0, len(audio) - segment_length, 4, dtype=int)
+        segment_window = np.hanning(segment_length)[None, :, None]
+        segments = np.stack([
+            audio[start:start + segment_length] * segment_window[0]
+            for start in starts
+        ])
+        welch = fft.rfft(segments, axis=1).transpose(1, 2, 0)
+        auto = np.mean(np.abs(welch)**2, axis=2)
 
+        windowed = audio * np.hanning(len(audio))[:, None]
+        nfft = fft.next_fast_len(2 * len(audio))
+        spectra = fft.rfft(windowed, nfft, axis=0)
         upsampled_size = nfft * self.interpolation
         max_shift = int(np.ceil(self.max_tdoa * self.sample_rate * self.interpolation))
         shifts = np.arange(-max_shift, max_shift + 1)
@@ -316,6 +385,7 @@ class SRPPhatLocalizer:
         self._pair_responses = np.empty(
             (len(self.pairs), len(shifts)), dtype=np.float32
         )
+        self._pair_weights = np.zeros(len(self.pairs), dtype=np.float64)
 
         for pair_number, (first, second) in enumerate(self.pairs):
             cross = spectra[:, first] * np.conj(spectra[:, second])
@@ -324,6 +394,26 @@ class SRPPhatLocalizer:
             response = correlation[shifts % upsampled_size]
             response /= max(float(np.max(np.abs(response))), 1e-15)
             self._pair_responses[pair_number] = response
+
+            mean_cross = np.mean(
+                welch[:, first, :] * np.conj(welch[:, second, :]), axis=1
+            )
+            denominator = auto[:, first] * auto[:, second]
+            coherence = np.clip(
+                np.abs(mean_cross)**2 / np.maximum(denominator, 1e-30), 0.0, 1.0
+            )
+            evidence = np.sqrt(denominator)
+            mean_coherence = float(
+                np.sum(coherence * evidence) / max(np.sum(evidence), 1e-30)
+            )
+            peak = int(np.argmax(response))
+            width = max(1, self.interpolation)
+            secondary = np.concatenate((response[:max(0, peak - width)], response[peak + width + 1:]))
+            second_peak = float(np.max(secondary)) if len(secondary) else 0.0
+            contrast = float(np.clip(
+                (response[peak] - second_peak) / max(abs(response[peak]), 1e-15), 0.0, 1.0
+            ))
+            self._pair_weights[pair_number] = mean_coherence * contrast
 
     @staticmethod
     def _grid(bounds: NDArray, step: float) -> NDArray:
@@ -337,7 +427,11 @@ class SRPPhatLocalizer:
         return np.column_stack([axis.ravel() for axis in mesh])
 
     def _score(self, candidates: NDArray) -> NDArray:
-        assert self._delay_grid is not None and self._pair_responses is not None
+        assert (
+            self._delay_grid is not None
+            and self._pair_responses is not None
+            and self._pair_weights is not None
+        )
         distances = np.linalg.norm(
             candidates[:, None, :] - self.positions[None, :, :], axis=-1
         )
@@ -347,14 +441,14 @@ class SRPPhatLocalizer:
 
         scores = np.zeros(len(candidates), dtype=np.float64)
         for pair_number in range(len(self.pairs)):
-            scores += np.interp(
+            scores += self._pair_weights[pair_number] * np.interp(
                 predicted_tdoa[:, pair_number],
                 self._delay_grid,
                 self._pair_responses[pair_number],
                 left=0.0,
                 right=0.0,
             )
-        return scores / len(self.pairs)
+        return scores / max(float(np.sum(self._pair_weights)), 1e-15)
 
     def localize(self, audio_frame: NDArray) -> LocalizationResult:
         """Locate the dominant broadband source in a short synchronized frame.
