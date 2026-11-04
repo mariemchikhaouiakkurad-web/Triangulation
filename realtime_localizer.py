@@ -162,6 +162,22 @@ def parse_channels(text: str, available: int) -> list[int]:
     return sorted(set(channels))
 
 
+def level_dbfs(
+    audio: np.ndarray,
+    sample_rate: float,
+    frequency_range: tuple[float, float] | None = None,
+) -> float:
+    if frequency_range is not None:
+        low, high = frequency_range
+        frequencies = np.fft.rfftfreq(len(audio), d=1.0 / sample_rate)
+        band = (frequencies >= low) & (frequencies <= high)
+        spectra = np.fft.rfft(audio, axis=0)
+        spectra[~band] = 0.0
+        audio = np.fft.irfft(spectra, n=len(audio), axis=0)
+    rms = np.sqrt(np.mean(audio**2))
+    return float(20.0 * np.log10(rms + 1e-12))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-devices", action="store_true")
@@ -184,7 +200,10 @@ def main() -> None:
     parser.add_argument("--min-score", type=float, default=0.25,
                         help="estimates below this SRP score are treated as no clear source")
     parser.add_argument("--min-level-db", type=float, default=-50.0,
-                        help="minimum broadband level for a live result in dBFS (default: -50)")
+                        help="minimum level in the selected band for a live result in dBFS (default: -50)")
+    parser.add_argument("--frequency-range", type=float, nargs=2,
+                        metavar=("LOW_HZ", "HIGH_HZ"),
+                        help="use only this frequency band for direction and sound level")
     parser.add_argument("--plot", action="store_true",
                         help="show the live unified 2D direction and microphone layout")
     parser.add_argument(
@@ -200,6 +219,10 @@ def main() -> None:
         parser.error("use --devices, --channels and --positions, or --list-devices")
     if args.calibration_seconds < 5:
         parser.error("use at least 5 calibration seconds")
+    if args.frequency_range is not None:
+        low, high = args.frequency_range
+        if not 0.0 <= low < high <= args.fs / 2:
+            parser.error("frequency range must satisfy 0 <= LOW_HZ < HIGH_HZ <= fs/2")
 
     # Skip an optional "x,y,z" header row.
     with open(args.positions) as f:
@@ -359,6 +382,7 @@ def main() -> None:
                 interpolation=2,
                 array_ids=array_ids[active],
                 use_cross_array=cross_array,
+                frequency_range=args.frequency_range,
             )
 
         localizer = build_localizer(use_cross)
@@ -424,7 +448,7 @@ def main() -> None:
 
             audio = np.concatenate(synchronized, axis=1)[:, active]
             result = localizer.localize(audio)
-            level = 20 * np.log10(np.sqrt(np.mean(audio**2)) + 1e-12)
+            level = level_dbfs(audio, fs, args.frequency_range)
             loud_enough = level >= args.min_level_db
             clear = loud_enough and result.score >= args.min_score
             reason = "no clear sound" if loud_enough else "below level threshold"

@@ -325,6 +325,7 @@ class SRPPhatLocalizer:
         interpolation: int = 4,
         array_ids: NDArray | None = None,
         use_cross_array: bool = True,
+        frequency_range: tuple[float, float] | None = None,
     ) -> None:
         self.positions = np.asarray(microphone_positions, dtype=np.float64)
         self.sample_rate = float(sample_rate)
@@ -333,6 +334,13 @@ class SRPPhatLocalizer:
         self.coarse_step = float(coarse_step)
         self.refinements = int(refinements)
         self.interpolation = int(interpolation)
+        self.frequency_range = frequency_range
+        if frequency_range is not None:
+            low, high = frequency_range
+            if not 0.0 <= low < high <= 0.5 * self.sample_rate:
+                raise ValueError(
+                    "frequency_range must satisfy 0 <= low < high <= sample_rate / 2"
+                )
 
         if self.positions.ndim != 2 or self.positions.shape[1] != 3:
             raise ValueError("microphone_positions must have shape (microphones, 3)")
@@ -373,11 +381,24 @@ class SRPPhatLocalizer:
             for start in starts
         ])
         welch = fft.rfft(segments, axis=1).transpose(1, 2, 0)
+        if self.frequency_range is not None:
+            low, high = self.frequency_range
+            frequencies = fft.rfftfreq(segment_length, d=1.0 / self.sample_rate)
+            band = (frequencies >= low) & (frequencies <= high)
+            if not np.any(band):
+                raise ValueError(
+                    "frequency_range contains no Welch frequency bins; widen the band"
+                )
+            welch = welch[band]
         auto = np.mean(np.abs(welch)**2, axis=2)
 
         windowed = audio * np.hanning(len(audio))[:, None]
         nfft = fft.next_fast_len(2 * len(audio))
         spectra = fft.rfft(windowed, nfft, axis=0)
+        if self.frequency_range is not None:
+            frequencies = fft.rfftfreq(nfft, d=1.0 / self.sample_rate)
+            band = (frequencies >= low) & (frequencies <= high)
+            spectra[~band] = 0.0
         upsampled_size = nfft * self.interpolation
         max_shift = int(np.ceil(self.max_tdoa * self.sample_rate * self.interpolation))
         shifts = np.arange(-max_shift, max_shift + 1)
@@ -451,7 +472,7 @@ class SRPPhatLocalizer:
         return scores / max(float(np.sum(self._pair_weights)), 1e-15)
 
     def localize(self, audio_frame: NDArray) -> LocalizationResult:
-        """Locate the dominant broadband source in a short synchronized frame.
+        """Locate the dominant source in the selected band from a synchronized frame.
 
         A frame of roughly 0.1-0.3 seconds is a useful starting point. Track
         speech by applying this method to overlapping frames and optionally

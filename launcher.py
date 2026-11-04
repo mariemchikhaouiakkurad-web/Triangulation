@@ -168,6 +168,8 @@ def run_command(args: argparse.Namespace) -> int:
         command.extend(["--speaker-position", *[str(value) for value in args.speaker_position]])
     if args.max_sync_error is not None:
         command.extend(["--max-sync-error", str(args.max_sync_error)])
+    if args.frequency_range is not None:
+        command.extend(["--frequency-range", *[str(value) for value in args.frequency_range]])
     if args.plot:
         command.append("--plot")
     print("\nMode: unified 2D direction (front=0 deg, right=+90 deg, left=-90 deg)")
@@ -224,7 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--refinements", type=int, default=3)
     run.add_argument("--min-score", type=float, default=0.25)
     run.add_argument("--min-level-db", type=float, default=-50.0,
-                     help="minimum level for a live direction in dBFS (default: -50)")
+                     help="minimum level in the selected band for a live direction in dBFS (default: -50)")
+    run.add_argument("--frequency-range", type=float, nargs=2,
+                     metavar=("LOW_HZ", "HIGH_HZ"),
+                     help="use only this frequency band for direction and sound level")
     run.add_argument(
         "--bounds", type=float, nargs=6, default=(-1, 1, -1, 1, 0, 0),
         metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"),
