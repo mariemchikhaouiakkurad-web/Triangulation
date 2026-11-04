@@ -104,8 +104,17 @@ class LivePlot:
         self.fig.tight_layout()
         self.pause(0.05)
 
-    def update(self, position: np.ndarray, score: float, level: float,
+    def update(self, position: np.ndarray | None, score: float, level: float,
                clear: bool) -> None:
+        if position is None:
+            self.direction.set_data([], [])
+            self.dot.set_data([], [])
+            self.fig.suptitle(
+                f"No accepted direction   score={score:.2f}   "
+                f"level={level:.0f} dBFS   no clear sound in selected band"
+            )
+            return
+
         x, y = position[:2]
         azimuth = np.degrees(np.arctan2(x, y))
         angle = np.arctan2(x, y)
@@ -118,7 +127,7 @@ class LivePlot:
         self.direction.set_color("red" if clear else "0.6")
         self.dot.set_data([display[0]], [display[1]])
         self.dot.set_color("red" if clear else "0.6")
-        status = "live" if clear else "last/uncertain - no clear sound"
+        status = "live" if clear else "last valid - no clear sound in selected band"
         self.fig.suptitle(
             f"Direction {azimuth:+.2f} deg   score={score:.2f}   "
             f"level={level:.0f} dBFS   {status}"
@@ -204,6 +213,8 @@ def main() -> None:
     parser.add_argument("--frequency-range", type=float, nargs=2,
                         metavar=("LOW_HZ", "HIGH_HZ"),
                         help="use only this frequency band for direction and sound level")
+    parser.add_argument("--no-level-gate", action="store_true",
+                        help="ignore sound energy; use only the selected band and SRP score")
     parser.add_argument("--plot", action="store_true",
                         help="show the live unified 2D direction and microphone layout")
     parser.add_argument(
@@ -449,7 +460,7 @@ def main() -> None:
             audio = np.concatenate(synchronized, axis=1)[:, active]
             result = localizer.localize(audio)
             level = level_dbfs(audio, fs, args.frequency_range)
-            loud_enough = level >= args.min_level_db
+            loud_enough = args.no_level_gate or level >= args.min_level_db
             clear = loud_enough and result.score >= args.min_score
             reason = "no clear sound" if loud_enough else "below level threshold"
             now = time.monotonic()
@@ -462,17 +473,21 @@ def main() -> None:
                 shown = last_result
                 status = f"last valid {now - last_result_time:.1f}s ago; {reason}"
             else:
-                shown = result
-                status = f"uncertain; {reason}"
+                shown = None
+                status = f"no accepted direction; {reason}"
             mode = "cross-array" if use_cross else "board-local"
+            direction = f"{shown.azimuth_deg:+7.2f} deg" if shown is not None else "--"
             print(
-                f"Direction: {shown.azimuth_deg:+7.2f} deg  "
+                f"Direction: {direction}  "
                 f"score={result.score:.3f} level={level:5.1f} dBFS  "
                 f"{mode}; {status}",
                 flush=True,
             )
             if plot:
-                plot.update(shown.position, result.score, level, clear)
+                plot.update(
+                    shown.position if shown is not None else None,
+                    result.score, level, clear,
+                )
             next_update = stop + hop_samples
 
     except KeyboardInterrupt:

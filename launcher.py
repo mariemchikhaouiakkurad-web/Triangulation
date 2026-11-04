@@ -170,6 +170,8 @@ def run_command(args: argparse.Namespace) -> int:
         command.extend(["--max-sync-error", str(args.max_sync_error)])
     if args.frequency_range is not None:
         command.extend(["--frequency-range", *[str(value) for value in args.frequency_range]])
+    if args.no_level_gate:
+        command.append("--no-level-gate")
     if args.plot:
         command.append("--plot")
     print("\nMode: unified 2D direction (front=0 deg, right=+90 deg, left=-90 deg)")
@@ -230,6 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--frequency-range", type=float, nargs=2,
                      metavar=("LOW_HZ", "HIGH_HZ"),
                      help="use only this frequency band for direction and sound level")
+    run.add_argument("--no-level-gate", action="store_true",
+                     help="ignore sound energy; use only the selected band and SRP score")
     run.add_argument(
         "--bounds", type=float, nargs=6, default=(-1, 1, -1, 1, 0, 0),
         metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"),
